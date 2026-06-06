@@ -49,8 +49,17 @@ case "$cmd" in
   research)
     exec "$PYTHON_BIN" "$SKILL_DIR/scripts/research_market.py" "$@"
     ;;
+  research-free|free-research)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/free_research_adapters.py" "$@"
+    ;;
+  research-browser|browser-research|browser-plan)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/browser_research_plan.py" "$@"
+    ;;
   score)
     exec "$PYTHON_BIN" "$SKILL_DIR/scripts/score_niches.py" "$@"
+    ;;
+  doctor)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/doctor.py" "$@"
     ;;
   help|-h|--help)
     cat <<USAGE
@@ -58,13 +67,19 @@ Merch Scout command wrapper
 
 Usage:
   merch-scout autopilot [args]
+  merch-scout doctor [--json]
+  merch-scout research-free <research_dir|research_jobs.json>
+  merch-scout research-browser <research_dir|research_jobs.json>
   merch-scout finalize-imagegen <run_dir>
   merch-scout validate-package <run_dir>
   merch-scout validate-png <image> --canvas <canvas>
 
 Examples:
-  merch-scout autopilot --generator demo --count 1 --products popsockets --marketplaces US --output-root runs
-  merch-scout autopilot --count 1 --products standard_apparel --marketplaces US --output-root runs
+  merch-scout doctor
+  merch-scout research-free runs/<timestamp>_research
+  merch-scout research-browser runs/<timestamp>_research
+  merch-scout autopilot --generator demo --depth quick --count 1 --products popsockets --marketplaces US --output-root runs
+  merch-scout autopilot --depth standard --count 1 --products standard_apparel --marketplaces US --output-root runs
 USAGE
     ;;
   *)

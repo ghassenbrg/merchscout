@@ -4,7 +4,7 @@
 import argparse
 from pathlib import Path
 
-from merch_scout_core import canvas_presets, marketplace_config, parse_csv, print_json, research_candidates, write_json
+from merch_scout_core import DEPTH_CHOICES, canvas_presets, marketplace_config, parse_csv, print_json, research_candidates, write_json
 
 
 def main() -> None:
@@ -13,6 +13,7 @@ def main() -> None:
     parser.add_argument("--marketplaces", default="auto")
     parser.add_argument("--products", default="auto")
     parser.add_argument("--target-pool-size", type=int, default=20)
+    parser.add_argument("--depth", choices=DEPTH_CHOICES, default="standard")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -22,6 +23,7 @@ def main() -> None:
         products=parse_csv(args.products, allowed=list(canvas_presets().keys())),
         target_pool_size=args.target_pool_size,
         seed=args.seed,
+        depth=args.depth,
     )
     if args.out:
         write_json(args.out, result)

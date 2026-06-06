@@ -15,6 +15,7 @@ Options:
   --force             Replace an existing non-symlink target.
   --no-deps           Do not install Python dependencies.
   --demo              Run a small demo generation after install.
+  --skip-doctor       Do not run the local capability report after install.
   -h, --help          Show this help.
 
 Examples:
@@ -32,6 +33,7 @@ COPY_MODE=0
 FORCE=0
 INSTALL_DEPS=1
 RUN_DEMO=0
+RUN_DOCTOR=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +59,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --demo)
       RUN_DEMO=1
+      shift
+      ;;
+    --skip-doctor)
+      RUN_DOCTOR=0
       shift
       ;;
     -h|--help)
@@ -141,12 +147,19 @@ echo
 echo "Invoke from Codex:"
 echo '  Use $merch-scout to generate 10 ready-to-upload Amazon Merch on Demand designs.'
 echo
-echo "Run production preparation manually, then let Codex call image_gen and finalize:"
-echo "  \"$CODEX_HOME_DIR/bin/merch-scout\" autopilot --count 1 --products standard_apparel --marketplaces US --output-root \"$SCRIPT_DIR/runs\""
+echo "Run production preparation manually, then let Codex research, call image_gen, and finalize:"
+echo "  \"$CODEX_HOME_DIR/bin/merch-scout\" autopilot --depth standard --count 1 --products standard_apparel --marketplaces US --output-root \"$SCRIPT_DIR/runs\""
+echo "  \"$CODEX_HOME_DIR/bin/merch-scout\" research-free \"$SCRIPT_DIR/runs/<timestamp>_research\""
+echo "  \"$CODEX_HOME_DIR/bin/merch-scout\" research-browser \"$SCRIPT_DIR/runs/<timestamp>_research\""
 echo
 echo "Run local demo/test mode without image_gen:"
-echo "  \"$CODEX_HOME_DIR/bin/merch-scout\" autopilot --generator demo --count 1 --products popsockets --marketplaces US --output-root \"$SCRIPT_DIR/runs\""
+echo "  \"$CODEX_HOME_DIR/bin/merch-scout\" autopilot --generator demo --depth quick --count 1 --products popsockets --marketplaces US --output-root \"$SCRIPT_DIR/runs\""
+
+if [[ "$RUN_DOCTOR" -eq 1 ]]; then
+  echo
+  "$CODEX_HOME_DIR/bin/merch-scout" doctor
+fi
 
 if [[ "$RUN_DEMO" -eq 1 ]]; then
-  "$CODEX_HOME_DIR/bin/merch-scout" autopilot --generator demo --count 1 --products popsockets --marketplaces US --output-root "$SCRIPT_DIR/runs"
+  "$CODEX_HOME_DIR/bin/merch-scout" autopilot --generator demo --depth quick --count 1 --products popsockets --marketplaces US --output-root "$SCRIPT_DIR/runs"
 fi

@@ -37,7 +37,49 @@ DEFAULT_FIELD_LIMITS = {
 }
 
 GENERATOR_CHOICES = ("imagegen", "demo")
+DEPTH_CHOICES = ("quick", "standard", "deep")
 CHROMA_KEY = "#00ff00"
+
+FALLBACK_OFFLINE_NOTICE = "This run used fallback/offline mode because external research/image generation was unavailable."
+
+DEPTH_PROFILES: dict[str, dict[str, Any]] = {
+    "quick": {
+        "description": "Local/demo-friendly smoke-test mode. Not intended for production upload decisions.",
+        "candidateMultiplier": 4,
+        "minimumResearchJobs": 8,
+        "researchJobMultiplier": 4,
+        "minObservations": 0,
+        "minTotalSources": 0,
+        "minSourcesPerObservation": 0,
+        "minSourceTypes": 0,
+        "minVariants": 2,
+        "requiresExternalResearch": False,
+    },
+    "standard": {
+        "description": "Production default. Requires real Codex/browser research evidence before scoring and imagegen.",
+        "candidateMultiplier": 10,
+        "minimumResearchJobs": 18,
+        "researchJobMultiplier": 7,
+        "minObservations": 6,
+        "minTotalSources": 10,
+        "minSourcesPerObservation": 2,
+        "minSourceTypes": 3,
+        "minVariants": 4,
+        "requiresExternalResearch": True,
+    },
+    "deep": {
+        "description": "Expanded production research. More niche comparisons, more evidence, and more concept variants.",
+        "candidateMultiplier": 18,
+        "minimumResearchJobs": 36,
+        "researchJobMultiplier": 12,
+        "minObservations": 12,
+        "minTotalSources": 24,
+        "minSourcesPerObservation": 3,
+        "minSourceTypes": 4,
+        "minVariants": 6,
+        "requiresExternalResearch": True,
+    },
+}
 
 
 def load_json(path: Path) -> Any:
@@ -89,6 +131,12 @@ def parse_csv(value: str | None, allowed: list[str] | None = None) -> list[str] 
         if unknown:
             raise SystemExit(f"Unknown value(s): {', '.join(unknown)}. Allowed: {', '.join(allowed)}")
     return parsed
+
+
+def depth_profile(depth: str) -> dict[str, Any]:
+    if depth not in DEPTH_PROFILES:
+        raise SystemExit(f"Unknown depth: {depth}. Use one of: {', '.join(DEPTH_CHOICES)}")
+    return DEPTH_PROFILES[depth]
 
 
 def ensure_run_structure(run_dir: Path) -> dict[str, Path]:
@@ -342,6 +390,10 @@ def research_candidates(
     products: list[str] | None = None,
     target_pool_size: int = 20,
     seed: int = 7,
+    external_research: dict[str, Any] | None = None,
+    depth: str = "standard",
+    fallback_offline: bool = False,
+    requested_count: int = 1,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     pool = _expand_for_directed_niche(niche) if niche else _base_niche_pool()
@@ -364,6 +416,7 @@ def research_candidates(
             ),
             "keywordCandidates": c["keywords"],
         }
+        _apply_external_research(c, external_research)
         expanded.append(c)
     while len(expanded) < target_pool_size:
         base = dict(rng.choice(pool))
@@ -377,12 +430,614 @@ def research_candidates(
         expanded.append(base)
     return {
         "generatedAt": now_stamp(),
+        "depth": depth,
         "mode": "directed" if niche else "autopilot",
         "requestedMarketplaces": marketplaces or "auto",
         "requestedProducts": products or "auto",
+        "fallbackOffline": bool(fallback_offline),
+        "fallbackNotice": FALLBACK_OFFLINE_NOTICE if fallback_offline else "",
+        "externalResearchUsed": bool(external_research),
+        "externalResearch": external_research or {},
+        "evidenceValidation": validate_external_research(external_research, depth, requested_count=requested_count)
+        if external_research
+        else {"valid": depth == "quick", "errors": [] if depth == "quick" else ["No external research evidence file was supplied."], "warnings": [], "stats": {}},
         "candidateCount": len(expanded),
         "candidates": expanded,
     }
+
+
+def _apply_external_research(candidate: dict[str, Any], external_research: dict[str, Any] | None) -> None:
+    if not external_research:
+        return
+    observations = external_research.get("observations", [])
+    best: dict[str, Any] | None = None
+    best_overlap = 0
+    candidate_tokens = set(re.findall(r"[a-z0-9]+", f"{candidate.get('name','')} {candidate.get('niche','')} {' '.join(candidate.get('keywords', []))}".lower()))
+    for observation in observations:
+        observed_text = f"{observation.get('niche','')} {observation.get('query','')} {' '.join(observation.get('keywords', []))}".lower()
+        observed_tokens = set(re.findall(r"[a-z0-9]+", observed_text))
+        overlap = len(candidate_tokens & observed_tokens)
+        if overlap > best_overlap:
+            best = observation
+            best_overlap = overlap
+    if not best or best_overlap == 0:
+        return
+    if isinstance(best.get("demandSignal"), (int, float)):
+        candidate["demand"] = int(round((candidate.get("demand", 50) + best["demandSignal"]) / 2))
+    if isinstance(best.get("saturationSignal"), (int, float)):
+        candidate["saturation"] = int(round((candidate.get("saturation", 50) + best["saturationSignal"]) / 2))
+    if isinstance(best.get("originalityPotential"), (int, float)):
+        candidate["originality"] = int(round((candidate.get("originality", 50) + best["originalityPotential"]) / 2))
+    candidate.setdefault("researchSignals", {})
+    candidate["researchSignals"]["sourceMode"] = "local_seed_pool_plus_codex_research"
+    candidate["researchSignals"]["externalObservation"] = best
+
+
+def prepare_research_jobs(
+    output_root: Path,
+    count: int,
+    marketplaces: list[str] | None,
+    products: list[str] | None,
+    niche: str | None,
+    depth: str = "standard",
+    seed: int = 7,
+) -> dict[str, Any]:
+    profile = depth_profile(depth)
+    timestamp = now_stamp()
+    research_dir = output_root / f"{timestamp}_research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    seed_pool = research_candidates(
+        niche=niche,
+        marketplaces=marketplaces,
+        products=products,
+        target_pool_size=max(profile["minimumResearchJobs"], count * profile["researchJobMultiplier"]),
+        seed=seed,
+        depth=depth,
+        requested_count=count,
+    )
+    candidates = seed_pool["candidates"]
+    jobs = []
+    for idx, candidate in enumerate(candidates[: max(profile["minimumResearchJobs"], count * profile["researchJobMultiplier"])], start=1):
+        jobs.append(
+            {
+                "jobId": f"research_{idx:02d}_{slugify(candidate['name'])}",
+                "candidateName": candidate["name"],
+                "niche": candidate["niche"],
+                "visibleText": candidate["visibleText"],
+                "marketplaces": candidate.get("marketplaces", marketplaces or ["US", "UK"]),
+                "products": candidate.get("products", products or ["standard_apparel"]),
+                "keywords": candidate.get("keywords", []),
+                "localSeedScores": {
+                    "demand": candidate.get("demand"),
+                    "saturation": candidate.get("saturation"),
+                    "originality": candidate.get("originality"),
+                    "seasonality": candidate.get("seasonality"),
+                },
+                "researchQuestions": [
+                    "What demand signals exist for this niche and related keywords?",
+                    "How saturated does Amazon Merch / print-on-demand competition look?",
+                    "Which sub-niches are less saturated and still buyer-relevant?",
+                    "Which product canvas and marketplace fit best?",
+                    "Are there obvious trademark, public figure, brand, franchise, or policy risks?",
+                    "What design direction is common in the market, and how can this design remain original?",
+                ],
+                "suggestedQueries": [
+                    f"Amazon merch {candidate['niche']} shirt",
+                    f"Amazon {candidate['visibleText']} shirt",
+                    f"Google Trends {candidate['niche']}",
+                    f"trademark {candidate['visibleText']}",
+                    f"USPTO TESS {candidate['visibleText']}",
+                    f"WIPO Global Brand Database {candidate['visibleText']}",
+                    f"Amazon Merch on Demand content policy {candidate['niche']}",
+                ],
+                "requiredEvidence": [
+                    "At least one marketplace/demand observation.",
+                    "At least one saturation or competitor-density observation.",
+                    "At least one compliance/IP observation using official or public search sources where possible.",
+                    "At least one design-direction note explaining how to stay original.",
+                ],
+            }
+        )
+    template = {
+        "schemaVersion": "1.0.0",
+        "depth": depth,
+        "completedAt": "",
+        "method": "Codex research using web/browser/search where available; no unauthorized scraping.",
+        "webSearchUsed": False,
+        "browserResearchUsed": False,
+        "webSearchRequiredWhenAvailable": depth in {"standard", "deep"},
+        "fallbackOffline": False,
+        "fallbackReason": "",
+        "minimumEvidenceRequirements": {
+            "minObservations": max(profile["minObservations"], count * 2 if depth != "quick" else 0),
+            "minTotalSources": max(profile["minTotalSources"], count * 4 if depth == "standard" else count * 8 if depth == "deep" else 0),
+            "minSourcesPerObservation": profile["minSourcesPerObservation"],
+            "minSourceTypes": profile["minSourceTypes"],
+            "sourceTypes": ["marketplace", "trend", "keyword", "trademark", "policy", "design_direction"],
+        },
+        "queriesSearched": [],
+        "observations": [],
+        "rejectedCandidates": [],
+        "marketplaceComparisons": [],
+        "productComparisons": [],
+        "unresolvedRisks": [],
+        "instructions": [
+            "Replace this template with real findings before rerunning autopilot.",
+            "Use browsing/search tools where available and record every meaningful query in queriesSearched.",
+            "Use official/public trademark or policy sources where possible.",
+            "If browsing is unavailable, set fallbackOffline=true and explain fallbackReason. The final report will label the run.",
+        ],
+        "observationTemplate": {
+            "jobId": "research_01_candidate_slug",
+            "niche": "candidate niche",
+            "query": "query actually searched",
+            "demandSignal": 0,
+            "saturationSignal": 0,
+            "originalityPotential": 0,
+            "marketplaceFit": {"US": "why this market fits or does not fit"},
+            "productFit": {"standard_apparel": "why this product fits or does not fit"},
+            "keywords": ["keyword actually supported by research"],
+            "riskFlags": [{"severity": "low|medium|high", "type": "trademark|copyright|brand|public_figure|policy", "note": "risk note"}],
+            "notes": ["Specific observation, not generic filler."],
+            "sources": [{"title": "source title", "url": "https://example.com", "sourceType": "marketplace|trend|keyword|trademark|policy|design_direction", "note": "why it matters"}],
+        },
+    }
+    jobs_path = research_dir / "research_jobs.json"
+    evidence_path = research_dir / "external_research.json"
+    browser_tasks = build_browser_research_tasks(jobs, depth, count)
+    browser_tasks_path = research_dir / "browser_research_tasks.json"
+    browser_plan_path = research_dir / "browser_research_plan.md"
+    write_json(
+        jobs_path,
+        {
+            "schemaVersion": "1.0.0",
+            "status": "awaiting_codex_research",
+            "depth": depth,
+            "requestedCount": count,
+            "webSearchRequiredWhenAvailable": depth in {"standard", "deep"},
+            "qualityPriority": "Optimize for research depth, originality, compliance caution, and human-reviewable output rather than speed.",
+            "minimumEvidenceRequirements": template["minimumEvidenceRequirements"],
+            "comparisonRequirements": [
+                "Compare at least the listed niches before selecting winners.",
+                "Compare sub-niches, products, and marketplaces rather than only validating the first candidate.",
+                "Record rejected candidates with concrete reasons.",
+            ],
+            "browserResearchTasks": str(browser_tasks_path),
+            "jobs": jobs,
+        },
+    )
+    write_json(evidence_path, template)
+    write_json(browser_tasks_path, browser_tasks)
+    write_json(research_dir / "seed_candidates.json", seed_pool)
+    write_text(research_dir / "research_instructions.md", _research_instructions_markdown(jobs_path, evidence_path, depth, template["minimumEvidenceRequirements"]))
+    write_text(browser_plan_path, _browser_research_plan_markdown(browser_tasks))
+    return {
+        "createdAt": timestamp,
+        "status": "awaiting_codex_research",
+        "depth": depth,
+        "requestedCount": count,
+        "researchDir": str(research_dir),
+        "researchJobs": str(jobs_path),
+        "browserResearchTasks": str(browser_tasks_path),
+        "browserResearchPlan": str(browser_plan_path),
+        "researchEvidenceFile": str(evidence_path),
+        "nextStep": f"Fill {evidence_path} with real observations, then rerun autopilot with --research-file {evidence_path}",
+        "upload": False,
+        "humanReviewRequired": True,
+    }
+
+
+def _research_instructions_markdown(jobs_path: Path, evidence_path: Path, depth: str, requirements: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "# Merch Scout Research Instructions",
+            "",
+            f"Depth: `{depth}`",
+            f"Jobs: `{jobs_path}`",
+            f"Write evidence to: `{evidence_path}`",
+            "",
+            "For each candidate, gather demand, saturation, product fit, marketplace fit, keyword quality, design direction, and compliance/IP risk.",
+            "Use official/public sources where possible. Do not use unauthorized scraping.",
+            f"Minimum observations: {requirements.get('minObservations')}",
+            f"Minimum total sources: {requirements.get('minTotalSources')}",
+            f"Minimum sources per observation: {requirements.get('minSourcesPerObservation')}",
+            f"Minimum source types: {requirements.get('minSourceTypes')}",
+            "",
+            "Record actual queries, URLs, rejected candidates, scoring reasons, marketplace observations, product observations, and unresolved risks.",
+            "Do not start image generation until this research evidence file has been filled.",
+            "",
+        ]
+    )
+
+
+def build_browser_research_tasks(jobs: list[dict[str, Any]], depth: str, count: int) -> dict[str, Any]:
+    profile = depth_profile(depth)
+    task_count = max(profile["minObservations"], count * (2 if depth == "standard" else 4 if depth == "deep" else 1))
+    selected = jobs[: min(len(jobs), task_count)]
+    tasks = [_browser_task_for_job(job, depth) for job in selected]
+    return {
+        "schemaVersion": "1.0.0",
+        "status": "awaiting_browser_research",
+        "depth": depth,
+        "taskCount": len(tasks),
+        "toolPriority": [
+            {
+                "tool": "Codex web search",
+                "useFor": "Broad discovery, current source lookup, policy/trademark source discovery, and citation URLs.",
+            },
+            {
+                "tool": "Browser plugin / in-app browser",
+                "useFor": "Public page inspection, Amazon/search result visual scan, Google Trends, Openverse/design-direction pages, and screenshots where useful.",
+            },
+            {
+                "tool": "Chrome plugin",
+                "useFor": "Only when the user explicitly wants to use existing Chrome state, cookies, or logged-in pages. Do not use it to bypass access controls.",
+            },
+            {
+                "tool": "Playwright",
+                "useFor": "Repeatable screenshots or public-page checks when allowed by site terms. Avoid bulk scraping, login bypass, CAPTCHA bypass, or automated harvesting.",
+            },
+        ],
+        "rules": [
+            "Do not auto-upload anything.",
+            "Do not scrape in violation of a site's terms.",
+            "Do not bypass CAPTCHAs, paywalls, rate limits, login walls, or robots controls.",
+            "Use marketplace observations for positioning only; do not copy competitor artwork, titles, brands, tags, layouts, or phrases.",
+            "Capture human-reviewable observations: visible density, repeated phrases, product types, visual trends, pricing/rating/BSR if visibly available, and unresolved risks.",
+            "Every useful observation must be written into external_research.json with sourceType, URL, note, toolUsed, and fetched=true.",
+        ],
+        "evidenceMapping": {
+            "amazonListingScan": "sourceType=marketplace; contributes saturationSignal and marketplaceFit.",
+            "trendScan": "sourceType=trend; contributes demandSignal and seasonality notes.",
+            "keywordScan": "sourceType=keyword; contributes keyword quality and listing language.",
+            "designDirectionScan": "sourceType=design_direction; contributes originalityPotential and mustAvoid notes.",
+            "trademarkPolicyScan": "sourceType=trademark or policy; contributes riskFlags and unresolvedRisks.",
+        },
+        "tasks": tasks,
+    }
+
+
+def _browser_task_for_job(job: dict[str, Any], depth: str) -> dict[str, Any]:
+    visible = str(job.get("visibleText") or job.get("candidateName") or "")
+    niche = str(job.get("niche") or visible)
+    query = f"{visible} {niche}".strip()
+    markets = job.get("marketplaces") or ["US"]
+    products = job.get("products") or ["standard_apparel"]
+    return {
+        "jobId": job.get("jobId"),
+        "candidateName": job.get("candidateName"),
+        "niche": niche,
+        "visibleText": visible,
+        "depth": depth,
+        "recommendedTools": ["web search", "Browser plugin", "Playwright screenshots if useful and allowed"],
+        "marketplaces": markets,
+        "products": products,
+        "browserChecks": [
+            {
+                "type": "amazon_listing_scan",
+                "sourceType": "marketplace",
+                "tool": "Browser or Chrome; Playwright only for public screenshots and allowed checks.",
+                "urls": _amazon_research_urls(query, visible, markets),
+                "record": [
+                    "Approximate visible result density or crowding.",
+                    "Repeated phrases, obvious copycat layouts, or dominant visual motifs.",
+                    "Whether exact visible text appears crowded or risky.",
+                    "Product formats that appear common.",
+                    "Any visible rating/price/BSR signals if naturally shown.",
+                ],
+                "doNot": "Do not scrape result pages, paginate deeply, extract seller data, or copy listings.",
+            },
+            {
+                "type": "trend_scan",
+                "sourceType": "trend",
+                "tool": "Browser or web search.",
+                "urls": _trend_research_urls(query, markets),
+                "record": ["Trend direction if visible.", "Seasonality.", "Related rising terms if visible."],
+            },
+            {
+                "type": "keyword_language_scan",
+                "sourceType": "keyword",
+                "tool": "web search, Browser, free adapter output.",
+                "urls": _keyword_research_urls(query),
+                "record": ["Buyer wording.", "Gift-intent modifiers.", "Terms to avoid for policy or keyword stuffing."],
+            },
+            {
+                "type": "design_direction_scan",
+                "sourceType": "design_direction",
+                "tool": "Browser or image search. Use for mood/vocabulary only, never copying.",
+                "urls": _design_research_urls(query),
+                "record": [
+                    "Common visual motifs to avoid copying.",
+                    "Open whitespace, typography, icon/motif opportunities.",
+                    "Original direction recommendation.",
+                    "Protected/copyright-looking visual territory to avoid.",
+                ],
+            },
+            {
+                "type": "trademark_policy_scan",
+                "sourceType": "trademark",
+                "tool": "Browser or web search.",
+                "urls": _trademark_policy_urls(visible, niche, markets),
+                "record": [
+                    "Exact phrase/source searched.",
+                    "Obvious trademark/brand/public-figure/franchise/policy risk.",
+                    "Unresolved legal review questions.",
+                ],
+            },
+        ],
+        "externalResearchObservationSkeleton": {
+            "jobId": job.get("jobId"),
+            "niche": niche,
+            "query": query,
+            "demandSignal": 0,
+            "saturationSignal": 0,
+            "originalityPotential": 0,
+            "marketplaceFit": {market: "browser observation" for market in markets},
+            "productFit": {product: "browser observation" for product in products},
+            "keywords": [],
+            "riskFlags": [],
+            "notes": [],
+            "sources": [
+                {
+                    "title": "source title",
+                    "url": "https://source.example",
+                    "sourceType": "marketplace|trend|keyword|trademark|policy|design_direction",
+                    "toolUsed": "web_search|browser|chrome|playwright|free_adapter",
+                    "fetched": True,
+                    "note": "specific observation",
+                }
+            ],
+        },
+    }
+
+
+def _amazon_research_urls(query: str, visible: str, markets: list[str]) -> list[dict[str, str]]:
+    domains = {
+        "US": "www.amazon.com",
+        "UK": "www.amazon.co.uk",
+        "DE": "www.amazon.de",
+        "FR": "www.amazon.fr",
+        "IT": "www.amazon.it",
+        "ES": "www.amazon.es",
+        "JP": "www.amazon.co.jp",
+    }
+    urls = []
+    search_terms = [f"{query} shirt", f"{visible} shirt"] if visible else [f"{query} shirt"]
+    for market in markets:
+        domain = domains.get(market, "www.amazon.com")
+        for term in list(dict.fromkeys(search_terms)):
+            urls.append({"marketplace": market, "url": f"https://{domain}/s?k={quote_plus(term)}", "note": "Public Amazon search URL for manual/browser observation only."})
+    return urls
+
+
+def _trend_research_urls(query: str, markets: list[str]) -> list[dict[str, str]]:
+    geo = "US"
+    if "UK" in markets:
+        geo = "GB"
+    elif "JP" in markets:
+        geo = "JP"
+    return [
+        {"url": f"https://trends.google.com/trends/explore?date=today%205-y&geo={geo}&q={quote_plus(query)}", "note": "Google Trends browser check."},
+        {"url": f"https://www.google.com/search?q={quote_plus(query + ' trend merch')}", "note": "General trend/source discovery search."},
+    ]
+
+
+def _keyword_research_urls(query: str) -> list[dict[str, str]]:
+    return [
+        {"url": f"https://www.google.com/search?q={quote_plus(query + ' gift shirt')}", "note": "Buyer language and gift-intent wording."},
+        {"url": f"https://api.datamuse.com/words?ml={quote_plus(query)}&max=20", "note": "Free Datamuse keyword expansion API."},
+        {"url": f"https://duckduckgo.com/?q={quote_plus(query + ' merch shirt')}", "note": "Public search page for query language."},
+    ]
+
+
+def _design_research_urls(query: str) -> list[dict[str, str]]:
+    return [
+        {"url": f"https://openverse.org/search/image?q={quote_plus(query)}", "note": "Openverse visual context; use for broad motif vocabulary only."},
+        {"url": f"https://www.google.com/search?tbm=isch&q={quote_plus(query + ' vintage badge illustration')}", "note": "Image-search mood scan; do not copy artwork."},
+        {"url": f"https://www.pinterest.com/search/pins/?q={quote_plus(query + ' shirt design')}", "note": "Optional browser-only visual trend scan; do not copy and do not scrape."},
+    ]
+
+
+def _trademark_policy_urls(visible: str, niche: str, markets: list[str]) -> list[dict[str, str]]:
+    terms = [visible, niche]
+    urls = []
+    for term in [t for t in terms if t]:
+        for source in source_queries(term, markets):
+            urls.append({"url": source["url"], "note": source["name"], "market": source["market"]})
+    urls.extend(
+        [
+            {"url": "https://developer.amazon.com/merch", "note": "Official Amazon Merch on Demand entry point."},
+            {"url": f"https://www.google.com/search?q={quote_plus('Amazon Merch on Demand content policy ' + niche)}", "note": "Public policy discovery query."},
+        ]
+    )
+    return urls
+
+
+def _browser_research_plan_markdown(tasks_payload: dict[str, Any]) -> str:
+    lines = [
+        "# Browser Research Plan",
+        "",
+        f"Depth: `{tasks_payload.get('depth')}`",
+        "",
+        "## Tool Priority",
+        "",
+    ]
+    for item in tasks_payload.get("toolPriority", []):
+        lines.append(f"- {item['tool']}: {item['useFor']}")
+    lines.extend(["", "## Rules", ""])
+    for rule in tasks_payload.get("rules", []):
+        lines.append(f"- {rule}")
+    lines.extend(["", "## Tasks", ""])
+    for task in tasks_payload.get("tasks", []):
+        lines.extend(
+            [
+                f"### {task.get('jobId')} - {task.get('candidateName')}",
+                "",
+                f"- Niche: {task.get('niche')}",
+                f"- Visible text: {task.get('visibleText')}",
+                "",
+            ]
+        )
+        for check in task.get("browserChecks", []):
+            lines.append(f"#### {check['type']}")
+            lines.append("")
+            lines.append(f"- Source type: `{check['sourceType']}`")
+            lines.append(f"- Tool: {check['tool']}")
+            lines.append("- URLs:")
+            for url in check.get("urls", [])[:8]:
+                lines.append(f"  - {url.get('url')} - {url.get('note', '')}")
+            lines.append("- Record:")
+            for item in check.get("record", []):
+                lines.append(f"  - {item}")
+            if check.get("doNot"):
+                lines.append(f"- Do not: {check['doNot']}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def validate_external_research(evidence: dict[str, Any] | None, depth: str, requested_count: int = 1) -> dict[str, Any]:
+    profile = depth_profile(depth)
+    errors: list[str] = []
+    warnings: list[str] = []
+    stats: dict[str, Any] = {
+        "observationCount": 0,
+        "usableObservationCount": 0,
+        "totalSources": 0,
+        "sourceTypes": [],
+        "queryCount": 0,
+        "rejectedCandidateCount": 0,
+        "fallbackOffline": False,
+    }
+    if not evidence:
+        if profile["requiresExternalResearch"]:
+            errors.append("External research evidence is required for this depth.")
+        return {"valid": not errors, "errors": errors, "warnings": warnings, "stats": stats}
+
+    fallback_offline = bool(evidence.get("fallbackOffline"))
+    stats["fallbackOffline"] = fallback_offline
+    fallback_reason = str(evidence.get("fallbackReason", "")).strip()
+    if fallback_offline:
+        warnings.append(FALLBACK_OFFLINE_NOTICE)
+        if not fallback_reason:
+            errors.append("fallbackOffline=true requires fallbackReason.")
+    elif depth != "quick" and evidence.get("webSearchUsed") is not True and evidence.get("apiResearchUsed") is not True:
+        errors.append("webSearchUsed or apiResearchUsed must be true for standard/deep research unless fallbackOffline=true.")
+
+    observations = evidence.get("observations", [])
+    if not isinstance(observations, list):
+        errors.append("external research observations must be a list.")
+        observations = []
+    usable_observations = [obs for obs in observations if isinstance(obs, dict) and not _is_placeholder_observation(obs)]
+    stats["observationCount"] = len(observations)
+    stats["usableObservationCount"] = len(usable_observations)
+    if len(usable_observations) < len(observations):
+        warnings.append("Placeholder/example observations were ignored.")
+
+    queries = evidence.get("queriesSearched", [])
+    if isinstance(queries, list):
+        stats["queryCount"] = len([q for q in queries if str(q).strip()])
+    elif queries:
+        errors.append("queriesSearched must be a list.")
+
+    rejected_candidates = evidence.get("rejectedCandidates", [])
+    if isinstance(rejected_candidates, list):
+        stats["rejectedCandidateCount"] = len(rejected_candidates)
+    elif rejected_candidates:
+        errors.append("rejectedCandidates must be a list.")
+
+    all_sources: list[dict[str, Any]] = []
+    observations_with_enough_sources = 0
+    observations_with_scored_signals = 0
+    source_types: set[str] = set()
+    for idx, observation in enumerate(usable_observations, start=1):
+        for signal in ["demandSignal", "saturationSignal", "originalityPotential"]:
+            if signal not in observation or not isinstance(observation.get(signal), (int, float)):
+                errors.append(f"observation {idx} missing numeric {signal}.")
+        if all(isinstance(observation.get(signal), (int, float)) for signal in ["demandSignal", "saturationSignal", "originalityPotential"]):
+            observations_with_scored_signals += 1
+        sources = observation.get("sources", [])
+        if not isinstance(sources, list):
+            errors.append(f"observation {idx} sources must be a list.")
+            sources = []
+        usable_sources = [source for source in sources if _is_usable_source(source)]
+        if len(usable_sources) >= profile["minSourcesPerObservation"]:
+            observations_with_enough_sources += 1
+        elif not fallback_offline and profile["minSourcesPerObservation"]:
+            errors.append(f"observation {idx} needs at least {profile['minSourcesPerObservation']} usable source(s).")
+        all_sources.extend(usable_sources)
+        for source in usable_sources:
+            source_types.add(_source_type(source))
+        if not observation.get("marketplaceFit") and not fallback_offline and depth != "quick":
+            errors.append(f"observation {idx} missing marketplaceFit.")
+        if not observation.get("productFit") and not fallback_offline and depth != "quick":
+            errors.append(f"observation {idx} missing productFit.")
+        if not observation.get("notes") and not fallback_offline and depth != "quick":
+            errors.append(f"observation {idx} missing concrete notes.")
+
+    stats["totalSources"] = len(all_sources)
+    stats["sourceTypes"] = sorted(source_types)
+    stats["observationsWithEnoughSources"] = observations_with_enough_sources
+    stats["observationsWithScoredSignals"] = observations_with_scored_signals
+
+    requirements = evidence.get("minimumEvidenceRequirements", {})
+    min_observations = max(int(profile["minObservations"]), int(requirements.get("minObservations", 0) or 0), requested_count * (2 if depth == "standard" else 4 if depth == "deep" else 0))
+    min_total_sources = max(int(profile["minTotalSources"]), int(requirements.get("minTotalSources", 0) or 0), requested_count * (4 if depth == "standard" else 8 if depth == "deep" else 0))
+    min_source_types = max(int(profile["minSourceTypes"]), int(requirements.get("minSourceTypes", 0) or 0))
+
+    if not fallback_offline:
+        if len(usable_observations) < min_observations:
+            errors.append(f"{depth} depth requires at least {min_observations} usable research observations; found {len(usable_observations)}.")
+        if len(all_sources) < min_total_sources:
+            errors.append(f"{depth} depth requires at least {min_total_sources} usable research sources; found {len(all_sources)}.")
+        if len(source_types) < min_source_types:
+            errors.append(f"{depth} depth requires at least {min_source_types} source categories; found {len(source_types)}.")
+        if stats["queryCount"] < max(3, requested_count * 2) and depth != "quick":
+            errors.append("queriesSearched must list the real searches/browsing queries used.")
+        if stats["rejectedCandidateCount"] < max(1, requested_count) and depth != "quick":
+            errors.append("rejectedCandidates must explain what was considered and rejected.")
+    elif len(usable_observations) == 0:
+        warnings.append("Fallback/offline evidence has no usable observations; report will mark the run as fallback.")
+
+    return {"valid": not errors, "errors": errors, "warnings": warnings, "stats": stats}
+
+
+def _is_placeholder_observation(observation: dict[str, Any]) -> bool:
+    text = json.dumps(observation, ensure_ascii=False).lower()
+    return any(marker in text for marker in ["research_01_example", "example niche", "replace this example", "https://example.com"])
+
+
+def _is_usable_source(source: Any) -> bool:
+    if not isinstance(source, dict):
+        return False
+    if source.get("fetched") is False:
+        return False
+    url = str(source.get("url", "")).strip()
+    title = str(source.get("title", "")).strip()
+    if not title or not re.match(r"https?://", url):
+        return False
+    if "example.com" in url:
+        return False
+    return True
+
+
+def _source_type(source: dict[str, Any]) -> str:
+    explicit = str(source.get("sourceType", "")).strip().lower()
+    if explicit:
+        return explicit
+    text = f"{source.get('title', '')} {source.get('url', '')} {source.get('note', '')}".lower()
+    if any(token in text for token in ["uspto", "wipo", "euipo", "trademark", "ipo.gov", "j-platpat", "dpma"]):
+        return "trademark"
+    if any(token in text for token in ["policy", "content guideline", "amazon merch on demand"]):
+        return "policy"
+    if any(token in text for token in ["trend", "google trends", "seasonal"]):
+        return "trend"
+    if any(token in text for token in ["keyword", "search volume", "autosuggest"]):
+        return "keyword"
+    if any(token in text for token in ["amazon", "etsy", "redbubble", "teepublic", "marketplace"]):
+        return "marketplace"
+    if any(token in text for token in ["design", "visual", "style"]):
+        return "design_direction"
+    return "other"
 
 
 def flatten_forbidden_terms() -> list[dict[str, str]]:
@@ -567,6 +1222,42 @@ def trademark_check(terms: list[str], marketplaces: list[str] | None = None) -> 
     }
 
 
+def enrich_compliance_with_research(compliance: dict[str, Any], concept: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(compliance)
+    evidence = concept.get("researchEvidence") or {}
+    research_flags = evidence.get("riskFlags", []) if isinstance(evidence, dict) else []
+    if not isinstance(research_flags, list):
+        research_flags = []
+    external_sources = evidence.get("sources", []) if isinstance(evidence, dict) else []
+    if not isinstance(external_sources, list):
+        external_sources = []
+    enriched["researchRiskFlags"] = research_flags
+    enriched["externalEvidenceSources"] = external_sources
+    if research_flags:
+        high = any(str(flag.get("severity", "")).lower() == "high" for flag in research_flags if isinstance(flag, dict))
+        medium = any(str(flag.get("severity", "")).lower() == "medium" for flag in research_flags if isinstance(flag, dict))
+        if high:
+            enriched["riskLevel"] = "high"
+            enriched["blocked"] = True
+            enriched["statement"] = "Potential compliance or trademark/IP risk detected in Codex research. This is not legal advice. Human review is required before upload."
+        elif medium and enriched.get("riskLevel") == "low":
+            enriched["riskLevel"] = "medium"
+            enriched["statement"] = "Potential compliance or trademark/IP risk requires manual review. This is not legal advice. Human review is required before upload."
+    if external_sources:
+        enriched.setdefault("checks", [])
+        enriched["checks"].append(
+            {
+                "term": concept.get("visibleText") or concept.get("conceptName"),
+                "localRisk": {"riskLevel": enriched.get("riskLevel"), "hits": []},
+                "officialSourceQueries": [],
+                "liveLookup": "codex_research_recorded",
+                "notes": "External research sources were recorded by Codex and must still be reviewed by a human.",
+                "sources": external_sources,
+            }
+        )
+    return enriched
+
+
 def build_concept(candidate: dict[str, Any], index: int) -> dict[str, Any]:
     product_fit = candidate.get("products", ["standard_apparel"])
     style = candidate.get("style", "original typography-led merch design")
@@ -600,6 +1291,8 @@ def build_concept(candidate: dict[str, Any], index: int) -> dict[str, Any]:
             "Transparent background, strong print-safe margins, no logos, no protected IP."
         ),
         "scores": candidate.get("scores", {}),
+        "researchSignals": candidate.get("researchSignals", {}),
+        "researchEvidence": candidate.get("researchSignals", {}).get("externalObservation", {}),
         "keywords": candidate.get("keywords", []),
     }
     return concept
@@ -895,6 +1588,7 @@ def create_imagegen_jobs(
     canvas_keys: list[str],
     variants_per_concept: int,
     design_index: int,
+    depth: str = "standard",
 ) -> dict[str, Any]:
     paths = ensure_run_structure(run_dir)
     imagegen_dir = run_dir / "workspace" / "imagegen"
@@ -917,6 +1611,7 @@ def create_imagegen_jobs(
         "schemaVersion": "1.0.0",
         "status": "awaiting_codex_imagegen",
         "generator": "imagegen",
+        "depth": depth,
         "instructions": [
             "For each job, call the built-in Codex image_gen tool with prompt.",
             "Save or copy the generated source image to sourcePath.",
@@ -1208,7 +1903,7 @@ def finalize_imagegen_run(run_dir: Path) -> dict[str, Any]:
     compliance = load_json(run_dir / "workspace" / "compliance" / "trademark_checks.json")
     research = load_json(run_dir / "workspace" / "research" / "candidate_niches.json")
     scoring = load_json(run_dir / "workspace" / "research" / "scored_niches.json")
-    metadata = make_metadata(run_dir, concept, artwork_files, compliance)
+    metadata = make_metadata(run_dir, concept, artwork_files, compliance, research)
     write_json(run_dir / "output" / "metadata" / "merch_metadata.json", metadata)
     validation = validate_package(run_dir, metadata)
     write_json(run_dir / "output" / "validation" / "validation_summary.json", validation)
@@ -1452,6 +2147,7 @@ def make_metadata(
     concept: dict[str, Any],
     artwork_files: list[dict[str, Any]],
     compliance: dict[str, Any],
+    research: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     presets = canvas_presets()
     products: list[str] = []
@@ -1464,6 +2160,10 @@ def make_metadata(
     secondary = keywords[4:] + ["gift idea", "original design"]
     listings = {market: _listing_for_market(market, concept, primary, secondary) for market in marketplaces}
     risk_level = compliance.get("riskLevel", "low")
+    research = research or {}
+    artwork_generators = sorted({str(item.get("generator", "unknown")) for item in artwork_files})
+    generator_fallback = any("demo" in generator or "fallback" in generator for generator in artwork_generators)
+    fallback_offline = bool(research.get("fallbackOffline") or generator_fallback)
     metadata = {
         "schemaVersion": "1.0.0",
         "designId": run_dir.name,
@@ -1488,14 +2188,26 @@ def make_metadata(
             "fanArtRisk": any(hit["category"] == "copyright_risk" for hit in compliance.get("riskHits", [])),
             "policyNotes": [compliance.get("statement", REQUIRED_COMPLIANCE_WORDING)],
             "checkedSources": compliance.get("checks", []),
+            "researchRiskFlags": compliance.get("researchRiskFlags", []),
+            "externalEvidenceSources": compliance.get("externalEvidenceSources", []),
         },
         "researchSummary": {
             "niche": concept["niche"],
             "nicheType": concept.get("nicheType"),
+            "depth": research.get("depth"),
+            "externalResearchUsed": bool(research.get("externalResearchUsed")),
+            "fallbackOffline": fallback_offline,
+            "fallbackNotice": FALLBACK_OFFLINE_NOTICE if fallback_offline else "",
+            "evidenceValidation": research.get("evidenceValidation", {}),
+            "researchObservation": concept.get("researchEvidence", {}),
             "demandScore": concept.get("scores", {}).get("demandSignal"),
             "saturationScore": concept.get("scores", {}).get("lowToMediumSaturation"),
             "ipRiskScore": 100 - concept.get("scores", {}).get("complianceIpSafety", 0),
             "finalOpportunityScore": concept.get("scores", {}).get("finalOpportunityScore"),
+        },
+        "generationSummary": {
+            "artworkGenerators": artwork_generators,
+            "fallbackOrDemoUsed": generator_fallback,
         },
     }
     return metadata
@@ -1600,13 +2312,22 @@ def generate_report(
     scoring: dict[str, Any],
     compliance: dict[str, Any],
 ) -> str:
-    accepted = scoring.get("accepted", [])
     rejected = scoring.get("rejected", [])
+    external = research.get("externalResearch", {}) if isinstance(research.get("externalResearch"), dict) else {}
+    evidence_validation = research.get("evidenceValidation", {})
     final_recommendation = "Needs manual review"
     if validation.get("valid") and metadata.get("riskLevel") == "low":
         final_recommendation = "Ready for human review; upload only after manual approval"
     elif metadata.get("riskLevel") == "high":
         final_recommendation = "Do not upload until compliance issues are resolved"
+
+    fallback_used = _report_fallback_used(research, metadata)
+    selected_observation = concept.get("researchEvidence") or {}
+    source_lines = _source_report_lines(external, selected_observation, limit=24)
+    query_lines = _query_report_lines(external, selected_observation, limit=24)
+    marketplace_lines = _marketplace_report_lines(external, selected_observation, limit=16)
+    product_lines = _product_report_lines(external, selected_observation, limit=16)
+    unresolved_risk_lines = _unresolved_risk_lines(external, selected_observation, compliance)
 
     lines = [
         "# Merch Scout Report",
@@ -1617,43 +2338,89 @@ def generate_report(
         "",
         REQUIRED_COMPLIANCE_WORDING,
         "",
-        "## Design Summary",
-        "",
-        f"- Concept: {concept['conceptName']}",
-        f"- Niche: {concept['niche']}",
-        f"- Marketplaces: {', '.join(concept.get('marketplaces', []))}",
-        f"- Product canvases: {', '.join(concept.get('productFit', []))}",
-        f"- Design style: {concept.get('designStyle')}",
-        f"- Visible text: {concept.get('visibleText')}",
-        "",
-        "## Research Evidence",
-        "",
-        f"- Research mode: {research.get('mode')}",
-        "- Source mode: local seed pool plus optional external adapters.",
-        "- Competitor analysis is used only for market expectations; copying is prohibited.",
-        "",
-        "## Why This Niche Was Selected",
-        "",
-        f"- Final opportunity score: {concept.get('scores', {}).get('finalOpportunityScore')}",
-        f"- Demand signal: {concept.get('scores', {}).get('demandSignal')}",
-        f"- Product fit: {concept.get('scores', {}).get('productFit')}",
-        f"- Compliance/IP safety score: {concept.get('scores', {}).get('complianceIpSafety')}",
-        "",
-        "## Why Other Candidates Were Rejected",
-        "",
     ]
+    if fallback_used:
+        lines.extend([FALLBACK_OFFLINE_NOTICE, ""])
+    lines.extend(
+        [
+            "## Run Quality Mode",
+            "",
+            f"- Depth: {research.get('depth', 'unknown')}",
+            f"- Research mode: {research.get('mode')}",
+            f"- External research used: {bool(research.get('externalResearchUsed'))}",
+            f"- Evidence valid: {evidence_validation.get('valid')}",
+            f"- Evidence stats: {json.dumps(evidence_validation.get('stats', {}), ensure_ascii=False)}",
+            f"- Artwork generators: {', '.join(metadata.get('generationSummary', {}).get('artworkGenerators', [])) or 'unknown'}",
+            f"- Fallback/demo used: {bool(metadata.get('generationSummary', {}).get('fallbackOrDemoUsed') or research.get('fallbackOffline'))}",
+            "",
+            "## Design Summary",
+            "",
+            f"- Concept: {concept['conceptName']}",
+            f"- Niche: {concept['niche']}",
+            f"- Marketplaces: {', '.join(concept.get('marketplaces', []))}",
+            f"- Product canvases: {', '.join(concept.get('productFit', []))}",
+            f"- Design style: {concept.get('designStyle')}",
+            f"- Visible text: {concept.get('visibleText')}",
+            "",
+            "## Research Evidence",
+            "",
+            "### Queries Searched",
+            "",
+        ]
+    )
+    lines.extend(query_lines or ["- No external queries were recorded."])
+    lines.extend(["", "### Sources Checked", ""])
+    lines.extend(source_lines or ["- No external sources were recorded."])
+    lines.extend(["", "### Marketplace Observations", ""])
+    lines.extend(marketplace_lines or ["- No marketplace observations were recorded."])
+    lines.extend(["", "### Product Fit Observations", ""])
+    lines.extend(product_lines or ["- No product-fit observations were recorded."])
+    lines.extend(
+        [
+            "",
+            "### Selected Observation",
+            "",
+            f"- Query: {selected_observation.get('query', 'not recorded') if isinstance(selected_observation, dict) else 'not recorded'}",
+            f"- Demand signal: {selected_observation.get('demandSignal', 'not recorded') if isinstance(selected_observation, dict) else 'not recorded'}",
+            f"- Saturation signal: {selected_observation.get('saturationSignal', 'not recorded') if isinstance(selected_observation, dict) else 'not recorded'}",
+            f"- Originality potential: {selected_observation.get('originalityPotential', 'not recorded') if isinstance(selected_observation, dict) else 'not recorded'}",
+            f"- Notes: {'; '.join(selected_observation.get('notes', [])) if isinstance(selected_observation, dict) and selected_observation.get('notes') else 'not recorded'}",
+            "",
+            "## Why This Niche Was Selected",
+            "",
+        ]
+    )
+    for line in _scoring_reason_lines(concept):
+        lines.append(line)
+    lines.extend(["", "## Compared And Rejected Ideas", ""])
+    external_rejected = external.get("rejectedCandidates", []) if isinstance(external, dict) else []
+    if external_rejected:
+        for item in external_rejected[:12]:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("candidateName") or item.get("niche") or "unnamed candidate"
+                reason = item.get("reason") or item.get("rejectionReason") or item.get("notes") or "Rejected during research comparison."
+                lines.append(f"- {name}: {reason}")
     if rejected:
-        for item in rejected[:8]:
+        for item in rejected[:12]:
             reason = "; ".join(item.get("rejectionReasons", [])) or "Lower opportunity score."
-            lines.append(f"- {item['name']}: {reason}")
-    else:
-        lines.append("- No hard-rejected candidates in this run.")
+            score = item.get("scores", {}).get("finalOpportunityScore")
+            lines.append(f"- {item['name']}: {reason} Score: {score}.")
+    if not external_rejected and not rejected:
+        lines.append("- No rejected candidates were recorded; human reviewer should treat this as a research gap.")
+    lines.extend(["", "## Unresolved Risks", ""])
+    lines.extend(unresolved_risk_lines or ["- No unresolved risks were recorded beyond required manual legal/compliance review."])
     lines.extend(
         [
             "",
             "## Design Direction",
             "",
             concept.get("generationPrompt", ""),
+            "",
+            "Originality controls:",
+            "",
+            "- Use competitor observations only to understand buyer expectations.",
+            "- Do not copy competitor artwork, titles, brands, layouts, or protected phrases.",
+            "- Final visible text is rendered locally for spelling and layout control.",
             "",
             "## Keyword Strategy",
             "",
@@ -1666,6 +2433,7 @@ def generate_report(
             f"- Risk level: {compliance.get('riskLevel')}",
             f"- Statement: {compliance.get('statement')}",
             "- Live official database checks are optional adapters in v1; review source URLs manually when needed.",
+            "- Trademark/copyright/brand/public-figure/policy risk was linted locally and supplemented by recorded research evidence when supplied.",
             "",
             "## Validation Summary",
             "",
@@ -1678,7 +2446,7 @@ def generate_report(
         ]
     )
     for artwork in metadata.get("artworkFiles", []):
-        lines.append(f"- {artwork['file']} ({artwork['canvas']}, {artwork['width']}x{artwork['height']})")
+        lines.append(f"- {artwork['file']} ({artwork['canvas']}, {artwork['width']}x{artwork['height']}, generator: {artwork.get('generator', 'unknown')})")
     lines.extend(
         [
             "- output/metadata/merch_metadata.json",
@@ -1697,6 +2465,129 @@ def generate_report(
         ]
     )
     return "\n".join(lines)
+
+
+def _report_fallback_used(research: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    return bool(
+        research.get("fallbackOffline")
+        or metadata.get("researchSummary", {}).get("fallbackOffline")
+        or metadata.get("generationSummary", {}).get("fallbackOrDemoUsed")
+    )
+
+
+def _external_observations(external: dict[str, Any], selected_observation: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    observations = [obs for obs in external.get("observations", []) if isinstance(obs, dict)]
+    if selected_observation and isinstance(selected_observation, dict) and selected_observation not in observations:
+        observations.insert(0, selected_observation)
+    return observations
+
+
+def _query_report_lines(external: dict[str, Any], selected_observation: dict[str, Any], limit: int) -> list[str]:
+    queries = [str(q).strip() for q in external.get("queriesSearched", []) if str(q).strip()]
+    for observation in _external_observations(external, selected_observation):
+        query = str(observation.get("query", "")).strip()
+        if query:
+            queries.append(query)
+    lines = []
+    for query in list(dict.fromkeys(queries))[:limit]:
+        lines.append(f"- {query}")
+    return lines
+
+
+def _source_report_lines(external: dict[str, Any], selected_observation: dict[str, Any], limit: int) -> list[str]:
+    sources: list[dict[str, Any]] = []
+    for observation in _external_observations(external, selected_observation):
+        sources.extend([source for source in observation.get("sources", []) if isinstance(source, dict)])
+    lines = []
+    seen: set[str] = set()
+    for source in sources:
+        url = str(source.get("url", "")).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        title = str(source.get("title", "source")).strip() or "source"
+        note = str(source.get("note", "")).strip()
+        source_type = _source_type(source)
+        suffix = f" - {note}" if note else ""
+        lines.append(f"- [{title}]({url}) ({source_type}){suffix}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _marketplace_report_lines(external: dict[str, Any], selected_observation: dict[str, Any], limit: int) -> list[str]:
+    lines = []
+    for observation in _external_observations(external, selected_observation):
+        niche = observation.get("niche", "candidate")
+        fit = observation.get("marketplaceFit", {})
+        if isinstance(fit, dict):
+            for market, note in fit.items():
+                lines.append(f"- {niche} / {market}: {note}")
+                if len(lines) >= limit:
+                    return lines
+    marketplace_comparisons = external.get("marketplaceComparisons", [])
+    if not isinstance(marketplace_comparisons, list):
+        marketplace_comparisons = []
+    for item in marketplace_comparisons:
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('marketplace', 'marketplace')}: {item.get('observation', item.get('note', 'recorded'))}")
+            if len(lines) >= limit:
+                return lines
+    return lines
+
+
+def _product_report_lines(external: dict[str, Any], selected_observation: dict[str, Any], limit: int) -> list[str]:
+    lines = []
+    for observation in _external_observations(external, selected_observation):
+        niche = observation.get("niche", "candidate")
+        fit = observation.get("productFit", {})
+        if isinstance(fit, dict):
+            for product, note in fit.items():
+                lines.append(f"- {niche} / {product}: {note}")
+                if len(lines) >= limit:
+                    return lines
+    product_comparisons = external.get("productComparisons", [])
+    if not isinstance(product_comparisons, list):
+        product_comparisons = []
+    for item in product_comparisons:
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('product', 'product')}: {item.get('observation', item.get('note', 'recorded'))}")
+            if len(lines) >= limit:
+                return lines
+    return lines
+
+
+def _unresolved_risk_lines(external: dict[str, Any], selected_observation: dict[str, Any], compliance: dict[str, Any]) -> list[str]:
+    lines = []
+    unresolved_risks = external.get("unresolvedRisks", [])
+    if not isinstance(unresolved_risks, list):
+        unresolved_risks = []
+    for risk in unresolved_risks:
+        if isinstance(risk, dict):
+            lines.append(f"- {risk.get('type', 'risk')}: {risk.get('note', risk.get('reason', 'needs manual review'))}")
+        else:
+            lines.append(f"- {risk}")
+    for observation in _external_observations(external, selected_observation):
+        for flag in observation.get("riskFlags", []) if isinstance(observation.get("riskFlags"), list) else []:
+            if isinstance(flag, dict):
+                lines.append(f"- {flag.get('severity', 'unknown')} {flag.get('type', 'risk')}: {flag.get('note', 'needs review')}")
+    for hit in compliance.get("riskHits", []):
+        lines.append(f"- Local lint hit: {hit.get('term')} ({hit.get('category')})")
+    return list(dict.fromkeys(lines))
+
+
+def _scoring_reason_lines(concept: dict[str, Any]) -> list[str]:
+    scores = concept.get("scores", {})
+    return [
+        f"- Final opportunity score: {scores.get('finalOpportunityScore')}",
+        f"- Demand signal: {scores.get('demandSignal')} (buyer interest proxy from research/local seed data)",
+        f"- Low-to-medium saturation score: {scores.get('lowToMediumSaturation')} (higher means less crowded)",
+        f"- Product fit: {scores.get('productFit')}",
+        f"- Marketplace fit: {scores.get('marketplaceFit')}",
+        f"- Keyword quality: {scores.get('keywordQuality')}",
+        f"- Design originality potential: {scores.get('designOriginalityPotential')}",
+        f"- Compliance/IP safety score: {scores.get('complianceIpSafety')}",
+    ]
 
 
 def validate_package(run_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -1759,11 +2650,20 @@ class AutopilotRequest:
     image_adapter_command: str | None = None
     allow_demo_fallback: bool = True
     generator: str = "imagegen"
+    research_mode: str = "auto"
+    research_file: Path | None = None
+    depth: str = "standard"
 
 
 def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
     if request.generator not in GENERATOR_CHOICES:
         raise SystemExit(f"Unknown generator: {request.generator}. Use one of: {', '.join(GENERATOR_CHOICES)}")
+    profile = depth_profile(request.depth)
+    research_mode = request.research_mode
+    if research_mode == "auto":
+        research_mode = "local" if request.depth == "quick" or request.generator == "demo" else "codex"
+    if research_mode not in {"codex", "local"}:
+        raise SystemExit("Unknown research mode. Use auto, codex, or local.")
     presets = canvas_presets()
     markets = marketplace_config()
     selected_products = request.products or ["standard_apparel"]
@@ -1776,13 +2676,38 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
             raise SystemExit(f"Unknown marketplace: {market}")
 
     request.output_root.mkdir(parents=True, exist_ok=True)
+    if research_mode == "codex" and request.research_file is None:
+        return prepare_research_jobs(
+            output_root=request.output_root,
+            count=request.count,
+            marketplaces=selected_markets,
+            products=selected_products,
+            niche=request.niche,
+            depth=request.depth,
+            seed=request.seed,
+        )
+
+    external_research = load_json(request.research_file) if request.research_file else None
+    evidence_validation = validate_external_research(external_research, request.depth, requested_count=request.count)
+    if request.depth != "quick" and profile["requiresExternalResearch"] and not evidence_validation["valid"]:
+        raise SystemExit(
+            "Research evidence is not sufficient for "
+            f"{request.depth} depth. Fix {request.research_file or 'external_research.json'} before scoring:\n"
+            + "\n".join(f"- {error}" for error in evidence_validation["errors"])
+        )
+    fallback_offline = bool(evidence_validation.get("stats", {}).get("fallbackOffline")) or request.generator == "demo"
     research = research_candidates(
         niche=request.niche,
         marketplaces=selected_markets,
         products=selected_products,
-        target_pool_size=max(20, request.count * 4),
+        target_pool_size=max(profile["minimumResearchJobs"], request.count * profile["candidateMultiplier"]),
         seed=request.seed,
+        external_research=external_research,
+        depth=request.depth,
+        fallback_offline=fallback_offline,
+        requested_count=request.count,
     )
+    research["evidenceValidation"] = evidence_validation
     scoring = score_niches(research["candidates"])
     accepted = scoring["accepted"]
     if len(accepted) < request.count:
@@ -1790,6 +2715,7 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
 
     batch_stamp = now_stamp()
     run_summaries = []
+    variants_per_concept = max(request.variants_per_concept, profile["minVariants"])
     for idx, candidate in enumerate(accepted[: request.count], start=1):
         concept = build_concept(candidate, idx)
         # Respect explicit product constraints after concept creation.
@@ -1800,6 +2726,8 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
 
         write_json(paths["research"] / "candidate_niches.json", research)
         write_json(paths["research"] / "scored_niches.json", scoring)
+        write_json(paths["research"] / "external_research.json", external_research or {})
+        write_json(paths["research"] / "research_evidence_validation.json", evidence_validation)
         write_text(paths["research"] / "trend_notes.md", _trend_notes(concept, research))
         write_text(paths["research"] / "competitor_observations.md", _competitor_notes(concept))
         write_json(paths["research"] / "keyword_candidates.json", {"keywords": concept.get("keywords", [])})
@@ -1809,18 +2737,20 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
         compliance_terms = [concept["conceptName"], concept["visibleText"], concept["niche"], f"Scout {slugify(concept['niche']).split('-')[0].title()} Studio"]
         compliance_terms.extend(concept.get("keywords", []))
         compliance = trademark_check(compliance_terms, selected_markets)
+        compliance = enrich_compliance_with_research(compliance, concept)
         write_json(paths["compliance"] / "trademark_checks.json", compliance)
         write_json(paths["compliance"] / "risky_terms_removed.json", {"removed": [hit["term"] for hit in compliance.get("riskHits", [])]})
         write_text(paths["compliance"] / "policy_review.md", _policy_review(compliance))
 
         if request.generator == "imagegen":
-            manifest = create_imagegen_jobs(run_dir, concept, selected_products, request.variants_per_concept, idx)
+            manifest = create_imagegen_jobs(run_dir, concept, selected_products, variants_per_concept, idx, depth=request.depth)
             run_summaries.append(
                 {
                     "runDir": str(run_dir),
                     "concept": concept["conceptName"],
                     "valid": False,
                     "generator": "imagegen",
+                    "depth": request.depth,
                     "status": "awaiting_codex_imagegen",
                     "imagegenJobs": str(run_dir / "workspace" / "processing" / "imagegen_jobs.json"),
                     "nextStep": f"Call image_gen for each job, save sourcePath files, then run: python3 {SKILL_ROOT / 'scripts' / 'finalize_imagegen.py'} {run_dir}",
@@ -1830,7 +2760,7 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
 
         option_scores = []
         primary_canvas = selected_products[0]
-        for option in range(1, request.variants_per_concept + 1):
+        for option in range(1, variants_per_concept + 1):
             option_path = paths["candidates"] / f"option_{chr(96 + option)}_{primary_canvas}.png"
             generated = generate_design(
                 concept,
@@ -1883,14 +2813,14 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
                 }
             )
 
-        metadata = make_metadata(run_dir, concept, artwork_files, compliance)
+        metadata = make_metadata(run_dir, concept, artwork_files, compliance, research)
         write_json(paths["metadata"] / "merch_metadata.json", metadata)
         validation = validate_package(run_dir, metadata)
         write_json(paths["validation"] / "validation_summary.json", validation)
         report = generate_report(run_dir, concept, metadata, validation, research, scoring, compliance)
         write_text(paths["report"] / "merch_report.md", report)
         package_summary = package_output(run_dir)
-        run_summaries.append({"runDir": str(run_dir), "concept": concept["conceptName"], "valid": validation["valid"], "package": package_summary})
+        run_summaries.append({"runDir": str(run_dir), "concept": concept["conceptName"], "valid": validation["valid"], "depth": request.depth, "package": package_summary})
 
     created_count = 0 if request.generator == "imagegen" else len(run_summaries)
     batch_summary = {
@@ -1899,6 +2829,10 @@ def run_autopilot(request: AutopilotRequest) -> dict[str, Any]:
         "createdCount": created_count,
         "preparedCount": len(run_summaries),
         "generator": request.generator,
+        "depth": request.depth,
+        "researchMode": research_mode,
+        "fallbackOffline": fallback_offline,
+        "fallbackNotice": FALLBACK_OFFLINE_NOTICE if fallback_offline else "",
         "status": "awaiting_codex_imagegen" if request.generator == "imagegen" else "complete",
         "runs": run_summaries,
         "upload": False,
@@ -1972,6 +2906,12 @@ def build_autopilot_parser() -> argparse.ArgumentParser:
     parser.add_argument("--marketplaces", default="auto", help="Comma-separated marketplace codes, or auto.")
     parser.add_argument("--products", default="auto", help="Comma-separated canvas keys, or auto.")
     parser.add_argument("--niche", default=None, help="Optional directed niche.")
+    parser.add_argument(
+        "--depth",
+        choices=DEPTH_CHOICES,
+        default="standard",
+        help="quick is local/test only; standard is production default with real research; deep expands research and candidates.",
+    )
     parser.add_argument("--variants-per-concept", type=int, default=3, help="Candidate options to preserve in workspace.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Root folder for runs.")
     parser.add_argument("--seed", type=int, default=7, help="Deterministic scoring seed.")
@@ -1980,6 +2920,18 @@ def build_autopilot_parser() -> argparse.ArgumentParser:
         choices=GENERATOR_CHOICES,
         default="imagegen",
         help="Production default is imagegen. Use demo only for fallback, CI, or local smoke tests.",
+    )
+    parser.add_argument(
+        "--research-mode",
+        choices=["auto", "codex", "local"],
+        default="auto",
+        help="auto means codex research for imagegen production and local seed research for demo.",
+    )
+    parser.add_argument(
+        "--research-file",
+        type=Path,
+        default=None,
+        help="External research evidence JSON produced from research_jobs.json.",
     )
     parser.add_argument(
         "--image-adapter-command",
@@ -2004,12 +2956,15 @@ def autopilot_from_args(argv: list[str] | None = None) -> dict[str, Any]:
         marketplaces=parse_csv(args.marketplaces, allowed=list(marketplace_config().keys())),
         products=parse_csv(args.products, allowed=list(canvas_presets().keys())),
         niche=args.niche,
+        depth=args.depth,
         variants_per_concept=max(1, args.variants_per_concept),
         output_root=args.output_root,
         seed=args.seed,
         image_adapter_command=args.image_adapter_command,
         allow_demo_fallback=not args.no_demo_fallback,
         generator=args.generator,
+        research_mode=args.research_mode,
+        research_file=args.research_file,
     )
     return run_autopilot(request)
 
