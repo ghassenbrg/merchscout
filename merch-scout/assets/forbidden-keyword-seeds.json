@@ -1,0 +1,63 @@
+{
+  "brands_and_franchises": [
+    "amazon",
+    "disney",
+    "marvel",
+    "star wars",
+    "pokemon",
+    "nintendo",
+    "hello kitty",
+    "sanrio",
+    "harry potter",
+    "hogwarts",
+    "minecraft",
+    "fortnite",
+    "lego",
+    "nike",
+    "adidas",
+    "github",
+    "java",
+    "python logo",
+    "tesla",
+    "apple",
+    "netflix"
+  ],
+  "public_figures_and_groups": [
+    "taylor swift",
+    "bts",
+    "blackpink",
+    "elon musk",
+    "trump",
+    "biden",
+    "lebron",
+    "messi",
+    "nba",
+    "nfl",
+    "mlb",
+    "fifa",
+    "olympics"
+  ],
+  "policy_risk_terms": [
+    "official",
+    "licensed",
+    "best seller",
+    "guaranteed",
+    "cure",
+    "weapon",
+    "hate",
+    "violent",
+    "racist",
+    "terror",
+    "sexually explicit",
+    "drugs"
+  ],
+  "copyright_risk": [
+    "lyrics",
+    "quote from",
+    "fan art",
+    "in the style of",
+    "logo",
+    "album cover",
+    "movie poster"
+  ]
+}

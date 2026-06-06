@@ -1,0 +1,10 @@
+{
+  "imageAdapterCommand": "python3 /absolute/path/to/your_adapter.py",
+  "notes": [
+    "Codex image_gen is the preferred production path when running as a Codex skill.",
+    "Use this external adapter config only for non-Codex environments or specialized local generators.",
+    "Set MERCH_SCOUT_CONFIG=/path/to/this-file.json, or pass --image-adapter-command directly with --generator demo.",
+    "The command receives a JSON payload on stdin and must write a PNG to payload.outputPath.",
+    "For offline fallback/testing, use --generator demo."
+  ]
+}

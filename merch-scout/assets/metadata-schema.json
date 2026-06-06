@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.codex/merch-scout/metadata-schema.json",
+  "title": "Merch Scout Metadata",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schemaVersion",
+    "designId",
+    "status",
+    "riskLevel",
+    "upload",
+    "humanReviewRequired",
+    "selectedProducts",
+    "selectedMarketplaces",
+    "artworkFiles",
+    "listings",
+    "keywords",
+    "compliance",
+    "researchSummary"
+  ],
+  "properties": {
+    "schemaVersion": {"type": "string"},
+    "designId": {"type": "string", "minLength": 1},
+    "status": {"const": "ready_for_human_review"},
+    "riskLevel": {"enum": ["low", "medium", "high"]},
+    "upload": {"const": false},
+    "humanReviewRequired": {"const": true},
+    "selectedProducts": {"type": "array", "items": {"type": "string"}},
+    "selectedMarketplaces": {"type": "array", "items": {"type": "string"}},
+    "artworkFiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "canvas", "width", "height", "transparent", "validated"],
+        "properties": {
+          "file": {"type": "string"},
+          "canvas": {"type": "string"},
+          "width": {"type": "integer", "minimum": 1},
+          "height": {"type": "integer", "minimum": 1},
+          "transparent": {"type": "boolean"},
+          "validated": {"type": "boolean"},
+          "generator": {"type": "string"}
+        }
+      }
+    },
+    "listings": {"type": "object"},
+    "keywords": {
+      "type": "object",
+      "required": ["primary", "secondary", "removedForRisk"],
+      "properties": {
+        "primary": {"type": "array", "items": {"type": "string"}},
+        "secondary": {"type": "array", "items": {"type": "string"}},
+        "removedForRisk": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "compliance": {"type": "object"},
+    "researchSummary": {"type": "object"}
+  }
+}

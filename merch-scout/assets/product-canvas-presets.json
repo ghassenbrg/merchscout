@@ -1,0 +1,83 @@
+{
+  "standard_apparel": {
+    "size": [4500, 5400],
+    "products": [
+      "standard_t_shirt",
+      "premium_t_shirt",
+      "long_sleeve_t_shirt",
+      "sweatshirt",
+      "pullover_hoodie_back"
+    ],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "cropped_apparel_front_hoodie": {
+    "size": [4500, 4050],
+    "products": [
+      "crop_top",
+      "crop_sweatshirt",
+      "pullover_hoodie_front",
+      "zip_hoodie_front"
+    ],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "performance_square": {
+    "size": [1200, 1200],
+    "products": [
+      "performance_polo",
+      "performance_quarter_zip"
+    ],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "hats": {
+    "size": [1500, 675],
+    "products": [
+      "printed_baseball_hat",
+      "printed_trucker_hat",
+      "sport_sun_visor"
+    ],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "popsockets": {
+    "size": [485, 485],
+    "products": ["popsockets_grip"],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "phone_cases": {
+    "size": [1800, 3200],
+    "products": ["iphone_case"],
+    "background": "full_bleed",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "tote_pillow": {
+    "size": [2925, 2925],
+    "products": ["tote_bag", "throw_pillow"],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "tumblers_bottles": {
+    "size": [3000, 1400],
+    "products": ["tumbler", "water_bottle"],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  },
+  "mugs": {
+    "size": [2700, 1050],
+    "products": ["mug"],
+    "background": "transparent_png",
+    "maxFileSizeMb": 25,
+    "dpi": 300
+  }
+}

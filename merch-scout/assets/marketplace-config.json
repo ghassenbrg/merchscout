@@ -1,0 +1,37 @@
+{
+  "US": {
+    "domain": "amazon.com",
+    "language": "en-US",
+    "currency": "USD"
+  },
+  "UK": {
+    "domain": "amazon.co.uk",
+    "language": "en-GB",
+    "currency": "GBP"
+  },
+  "DE": {
+    "domain": "amazon.de",
+    "language": "de-DE",
+    "currency": "EUR"
+  },
+  "FR": {
+    "domain": "amazon.fr",
+    "language": "fr-FR",
+    "currency": "EUR"
+  },
+  "IT": {
+    "domain": "amazon.it",
+    "language": "it-IT",
+    "currency": "EUR"
+  },
+  "ES": {
+    "domain": "amazon.es",
+    "language": "es-ES",
+    "currency": "EUR"
+  },
+  "JP": {
+    "domain": "amazon.co.jp",
+    "language": "ja-JP",
+    "currency": "JPY"
+  }
+}

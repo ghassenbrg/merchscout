@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  if [[ "$SOURCE" != /* ]]; then
+    SOURCE="$DIR/$SOURCE"
+  fi
+done
+SKILL_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+VENV_PY="$CODEX_HOME_DIR/skills/.venvs/merch-scout/bin/python"
+
+if [[ -x "$VENV_PY" ]]; then
+  PYTHON_BIN="$VENV_PY"
+else
+  PYTHON_BIN="${PYTHON:-python3}"
+fi
+
+cmd="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$cmd" in
+  autopilot|run)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/autopilot.py" "$@"
+    ;;
+  finalize-imagegen|finalize)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/finalize_imagegen.py" "$@"
+    ;;
+  validate-package|validate)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/validate_package.py" "$@"
+    ;;
+  validate-png)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/validate_png.py" "$@"
+    ;;
+  validate-transparency)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/validate_transparency.py" "$@"
+    ;;
+  lint-metadata)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/metadata_lint.py" "$@"
+    ;;
+  lint-keywords)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/keyword_lint.py" "$@"
+    ;;
+  research)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/research_market.py" "$@"
+    ;;
+  score)
+    exec "$PYTHON_BIN" "$SKILL_DIR/scripts/score_niches.py" "$@"
+    ;;
+  help|-h|--help)
+    cat <<USAGE
+Merch Scout command wrapper
+
+Usage:
+  merch-scout autopilot [args]
+  merch-scout finalize-imagegen <run_dir>
+  merch-scout validate-package <run_dir>
+  merch-scout validate-png <image> --canvas <canvas>
+
+Examples:
+  merch-scout autopilot --generator demo --count 1 --products popsockets --marketplaces US --output-root runs
+  merch-scout autopilot --count 1 --products standard_apparel --marketplaces US --output-root runs
+USAGE
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "Run: merch-scout help" >&2
+    exit 2
+    ;;
+esac
